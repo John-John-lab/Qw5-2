@@ -2739,6 +2739,8 @@ app.layout = html.Div([
     dcc.Store(id="recalc-complete-trigger", data=0),
     dcc.Store(id="click-store", data={}),
     dcc.Store(id="signal-data-store", data=[]),  # store parsed signals
+    dcc.Store(id="golden-task-store-data", data=[]),  # ✅ NEW: Golden store for pre-processed tasks
+    dcc.Store(id="golden-store-version", data=0),     # ✅ NEW: Version tracker for golden store
     dcc.Store(id="chart-button-trigger", data=None),  # Hidden trigger for chart button clicks (JS sets this)
     dcc.Store(id="impulse-button-trigger", data=None),  # Hidden trigger for impulse button clicks (JS sets this)
     dcc.Store(id="strategy-details-trigger", data=None),  # Hidden trigger for strategy details button clicks (JS sets this)
@@ -3748,7 +3750,27 @@ def update_summary_stats_only(version, lock_state):
     global golden_task_store_data, golden_store_version, recalculation_complete_timestamp
     
     # Validate global state
-    if golden_task_store_data is None and not hasattr(tm, 'tasks'):
+    if not hasattr(app, 'layout') or app.layout is None:
+        return html.Div("", style={"display": "none"})
+    
+    # Get tasks from dcc.Store via callback context or fallback to global
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+        
+    # Check if version changed (to avoid recalc on lock state changes alone)
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    if triggered_id == "recalc-lock-store":
+        return dash.no_update  # Don't recalc stats just because lock changed
+        
+    # Try to get data from store first, fallback to global
+    try:
+        # In a real dcc.Store setup, we'd get this from Input, but for now use global
+        tasks = golden_task_store_data if golden_task_store_data else (list(tm.tasks.values()) if hasattr(tm, 'tasks') else [])
+    except:
+        tasks = []
+    
+    if not tasks:
         return html.Div("⏳ Initializing...", style={"textAlign": "center", "padding": "20px", "color": "#666"})
     
     # Lock check
@@ -3946,8 +3968,22 @@ def update_task_table_only(current_page, version, lock_state):
     global golden_task_store_data, golden_store_version
     
     # Validate global state
-    if golden_task_store_data is None and not hasattr(tm, 'tasks'):
-        return html.Div("⏳ Initializing...", style={"textAlign": "center", "padding": "20px", "color": "#666"})
+    if not hasattr(app, 'layout') or app.layout is None:
+        return html.Div("", style={"display": "none"})
+    
+    # Get triggered input to distinguish page change vs data reload
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+        
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # If only lock changed, don't re-render table
+    if triggered_id == "recalc-lock-store" and version == getattr(update_task_table_only, '_last_version', None):
+        return dash.no_update
+    
+    # Store current version for next comparison
+    update_task_table_only._last_version = version
     
     # Lock check
     if lock_state and lock_state.get("locked", False):

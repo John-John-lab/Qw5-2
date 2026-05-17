@@ -1,5 +1,1 @@
-```
-# Logs and temp files
-*.log
-app.log
-```
+Nothing should be ignored based on the provided file changes. The modified file 'qw_signal_2-7-5-json5-2-table.py' is a Python source file which should not be added to .gitignore. Since there are no build artifacts, dependencies, or temporary files in the changes, no additional ignore rules are needed.
