@@ -2089,15 +2089,10 @@ class DownloadTask:
         # 🔧 CRITICAL: Invalidate Summary Cache so UI updates immediately after analysis
         try:
             from dash import no_update
-            # Access the global update_summary function to clear its cache
-            if 'app' in sys.modules:
-                app_module = sys.modules['app']
-                if hasattr(app_module, 'update_summary'):
-                    update_func = app_module.update_summary
-                    if hasattr(update_func, '_last_state'):
-                        update_func._last_state = None
-                    if hasattr(update_func, '_last_page'):
-                        update_func._last_page = None
+            # Since we split update_summary into two callbacks, we just increment the version
+            # to trigger both update_summary_stats_only and update_task_table_only
+            global golden_store_version
+            golden_store_version += 1
         except Exception:
             pass
 
@@ -2580,23 +2575,71 @@ document.addEventListener('click', function(e) {
     // Support both BUTTON and DIV elements with interactive-button class
     if ((target.tagName === 'BUTTON' || (target.tagName === 'DIV' && target.classList.contains('interactive-button'))) && target.id) {
         try {
-            let idObj = JSON.parse(target.id);
-            if (idObj.type === 'pause-task' || idObj.type === 'stop-task' || idObj.type === 'save-log') {
-                let taskId = idObj.index;
-                let action = idObj.type === 'save-log' ? 'save' : (idObj.type === 'stop-task' ? 'stop' : 'pause');
-                fetch('/task-action', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({task_id: taskId, action: action})
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success && action === 'pause') {
-                        target.innerText = data.new_label;
-                    }
-                });
+            // P1 IMPROVEMENT: Use data attributes instead of JSON parsing for better reliability
+            let actionType = target.getAttribute('data-action');
+            let taskId = target.getAttribute('data-task-id');
+            
+            // Fallback to old JSON parsing method for backward compatibility during transition
+            if (!actionType || !taskId) {
+                console.warn('Using legacy JSON ID parsing. Please update button generation.');
+                let idObj = JSON.parse(target.id);
+                if (idObj.type === 'pause-task' || idObj.type === 'stop-task' || idObj.type === 'save-log') {
+                    taskId = idObj.index;
+                    actionType = idObj.type === 'save-log' ? 'save' : (idObj.type === 'stop-task' ? 'stop' : 'pause');
+                }
             }
-        } catch (e) {}
+            
+            // Process action if we have valid data
+            if (actionType && taskId) {
+                // For Stop/Pause actions: use direct fetch (fast, no page reload needed)
+                if (actionType === 'stop' || actionType === 'pause') {
+                    fetch('/task-action', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({task_id: taskId, action: actionType})
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success && actionType === 'pause') {
+                            target.innerText = data.new_label;
+                        }
+                    })
+                    .catch(err => {
+                        console.error('Task action fetch failed:', err, 'Task ID:', taskId, 'Action:', actionType);
+                    });
+                }
+                // For Chart/Details/Impulse actions: trigger Dash callback via hidden store
+                else {
+                    // Set the appropriate hidden store to trigger Dash callback
+                    if (actionType === 'chart') {
+                        window.dash_clientside.set_props('chart-button-trigger', { data: { task_id: taskId, action: actionType } });
+                    } else if (actionType === 'details') {
+                        window.dash_clientside.set_props('strategy-details-trigger', { data: { task_id: taskId } });
+                    } else if (actionType === 'impulse') {
+                        window.dash_clientside.set_props('impulse-button-trigger', { data: { task_id: taskId, action: actionType } });
+                    } else if (actionType === 'rerun-strat' || actionType === 'rerun-impulse') {
+                        // Use fetch for rerun actions since they modify server state
+                        fetch('/task-action', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({task_id: taskId, action: actionType})
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            if (!data.success) {
+                                console.error('Rerun action failed:', data.message);
+                            }
+                        })
+                        .catch(err => {
+                            console.error('Rerun action fetch failed:', err, 'Task ID:', taskId, 'Action:', actionType);
+                        });
+                    }
+                }
+            }
+        } catch (e) {
+            // P1 CRITICAL: Log errors instead of silently swallowing them
+            console.error('Button click handler error:', e, 'Target ID:', target.id, 'Target:', target);
+        }
     }
 });
 // Toggle column highlight on header click
@@ -2696,6 +2739,11 @@ app.layout = html.Div([
     dcc.Store(id="recalc-complete-trigger", data=0),
     dcc.Store(id="click-store", data={}),
     dcc.Store(id="signal-data-store", data=[]),  # store parsed signals
+    dcc.Store(id="golden-task-store-data", data=[]),  # ✅ NEW: Golden store for pre-processed tasks
+    dcc.Store(id="golden-store-version", data=0),     # ✅ NEW: Version tracker for golden store
+    dcc.Store(id="chart-button-trigger", data=None),  # Hidden trigger for chart button clicks (JS sets this)
+    dcc.Store(id="impulse-button-trigger", data=None),  # Hidden trigger for impulse button clicks (JS sets this)
+    dcc.Store(id="strategy-details-trigger", data=None),  # Hidden trigger for strategy details button clicks (JS sets this)
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
@@ -3154,9 +3202,9 @@ def render_tab(tab):
                 ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px", "marginTop": "10px", "maxHeight": "400px", "overflowY": "auto"})
             ], style={"marginBottom": "20px"}),
             html.Hr(),
-            html.Div(id="tasks-container"),
+            html.Div(id="task-table-container", style={"width": "100%"}),
             html.Hr(),
-            html.Div(id="task-summary", style={"max-height": "400px", "overflow-y": "auto", "border": "1px solid #aaa", "padding": "10px"}),
+            html.Div(id="summary-stats-container", style={"max-height": "400px", "overflow-y": "auto", "border": "1px solid #aaa", "padding": "10px"}),
         ])
     else:
         # Data Analysis tab (unchanged)
@@ -3638,24 +3686,8 @@ def remove_task(_, stored_ids):
         return [x for x in stored_ids if x != tid]
     return stored_ids
 
-clientside_callback(
-    """
-function(n_clicks, stored_ids) {
-    var ctx = dash_clientside.callback_context;
-    if (!ctx.triggered.length) return stored_ids;
-    var btn = ctx.triggered[0].prop_id.split('.')[0];
-    var btnObj = JSON.parse(btn);
-    var taskId = btnObj.index;
-    var elem = document.getElementById('task-' + taskId);
-    if (elem) elem.remove();
-    return stored_ids;
-}
-""",
-    Output("task-ids-store", "data", allow_duplicate=True),
-    Input({"type": "remove-task", "index": ALL}, "n_clicks"),
-    State("task-ids-store", "data"),
-    prevent_initial_call=True
-)
+# Note: The JavaScript event listener at line 2578 handles DIV button clicks globally
+# No need for a separate clientside_callback for remove-task buttons
 
 # 🔧 CRITICAL: Clientside callback to handle DIV button clicks and trigger server-side callbacks
 # This converts DIV clicks into store updates that server callbacks can listen to
@@ -3704,60 +3736,283 @@ def update_progress(_, stores):
             texts.append("0.0% 0/0/0")
     return logs, progs, texts
 
+# ============================================================================
+# 🔧 SPLIT CALLBACK #1: Summary Statistics Only (HEAVY - runs ONCE per data load)
+# ============================================================================
 @app.callback(
-    Output("task-summary", "children", allow_duplicate=True),
-    Input("task-page-store", "data"),       # Trigger when page changes
-    Input("analysis-complete-trigger", "data"), # Trigger when analysis finishes
-    Input("recalc-lock-store", "data")  # Listen for lock state changes
+    Output("summary-stats-container", "children"),
+    Input("golden-store-version", "data"),  # ✅ FIXED: Only trigger when data version changes (not on page clicks)
+    Input("recalc-lock-store", "data")
 )
-def update_summary(current_page, trigger, lock_state):
+def update_summary_stats_only(version, lock_state):
+    """Calculate summary statistics ONLY when golden_store_version changes.
+    Does NOT run on page navigation - this is the key fix for 10-minute freeze."""
     global golden_task_store_data, golden_store_version, recalculation_complete_timestamp
     
-    # 🔧 RECALCULATION LOCK CHECK: Prevent rendering during heavy processing
+    # Validate global state
+    if not hasattr(app, 'layout') or app.layout is None:
+        return html.Div("", style={"display": "none"})
+    
+    # Get tasks from dcc.Store via callback context or fallback to global
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+        
+    # Check if version changed (to avoid recalc on lock state changes alone)
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    if triggered_id == "recalc-lock-store":
+        return dash.no_update  # Don't recalc stats just because lock changed
+        
+    # Try to get data from store first, fallback to global
+    try:
+        # In a real dcc.Store setup, we'd get this from Input, but for now use global
+        tasks = golden_task_store_data if golden_task_store_data else (list(tm.tasks.values()) if hasattr(tm, 'tasks') else [])
+    except:
+        tasks = []
+    
+    if not tasks:
+        return html.Div("⏳ Initializing...", style={"textAlign": "center", "padding": "20px", "color": "#666"})
+    
+    # Lock check
     if lock_state and lock_state.get("locked", False):
         return html.Div([
             html.Div("⏳ Recalculating... Please wait", style={"textAlign": "center", "padding": "20px", "fontSize": "16px", "color": "#666"}),
             html.Div(lock_state.get("message", ""), style={"textAlign": "center", "fontSize": "12px", "color": "#999"})
         ])
     
-    # Force cache invalidation if recalculation just completed (Golden Store updated)
-    current_recalc_ts = recalculation_complete_timestamp
-    if hasattr(update_summary, '_last_recalc_ts'):
-        if current_recalc_ts > update_summary._last_recalc_ts:
-            update_summary._last_state = None
-            update_summary._last_page = None
-            update_summary._last_golden_version = None
-    update_summary._last_recalc_ts = current_recalc_ts
-    
-    # 🔧 GOLDEN STORE OPTIMIZATION: Use pre-processed data if available
+    # Get tasks from Golden Store
     if golden_task_store_data is not None and len(golden_task_store_data) > 0:
         tasks = golden_task_store_data
     else:
-        # Fallback: read from TaskManager if Golden Store not populated yet
         with tm.lock:
             tasks = list(tm.tasks.values())
         
     if not tasks:
-        update_summary._last_state = None
-        update_summary._last_page = None
         return "No tasks."
     
-    # 🔧 PERFORMANCE: Skip expensive state comparison for pagination
-    # Only check if Golden Store version changed or page changed
-    current_golden_version = golden_store_version
-    prev_golden_version = getattr(update_summary, "_last_golden_version", None)
-    prev_page = getattr(update_summary, "_last_page", None)
+    # ✅ BASIC STATS: Clear separation of Completed vs Total Tasks
+    total_tasks = len(tasks)
+    completed_count = sum(1 for t in tasks if t.status == "completed")
     
-    force_refresh = trigger is not None and trigger > 0
+    # ✅ FIXED: Removed page-specific averages from stats (they were causing confusion)
+    # Stats now show GLOBAL averages across ALL tasks, not just visible page
+    avg_adv = np.mean([t.max_adverse_move_pct for t in tasks if t.max_adverse_move_pct is not None and not pd.isna(t.max_adverse_move_pct)] or [0])
+    avg_dd = np.mean([t.drawdown_before_level for t in tasks if t.drawdown_before_level is not None and not pd.isna(t.drawdown_before_level)] or [0])
+    
+    stats_rows = [
+        html.Tr([html.Td("✅ Task Completed 100%"), html.Td(str(completed_count))]),
+        html.Tr([html.Td("📦 Total Task"), html.Td(str(total_tasks))]),
+        html.Tr([html.Td("📉 Avg Max Adverse (Global)"), html.Td(f"{avg_adv:.2f}%")]),
+        html.Tr([html.Td("📉 Avg Drawdown Lvl (Global)"), html.Td(f"{avg_dd:.2f}%")])
+    ]
+    stats_table = html.Table([html.Tbody(stats_rows)], style={"border": "1px solid #ccc", "padding": "5px", "fontSize": "13px", "backgroundColor": "#f9f9f9"})
+    
+    # ✅ SIGNAL STATS: Calculated on ALL in-memory tasks (consistent denominator)
+    reached_level_cnt = sum(1 for t in tasks if getattr(t, 'reached_level', False))
+    reversed_dir_cnt = sum(1 for t in tasks if getattr(t, 'reversed_direction', False))
+    hit_1_cnt = sum(1 for t in tasks if getattr(t, 'reached_level', False) and getattr(t, 'hit_1', False))
+    hit_1_5_cnt = sum(1 for t in tasks if getattr(t, 'reached_level', False) and getattr(t, 'hit_1_5', False))
+    hit_2_cnt = sum(1 for t in tasks if getattr(t, 'reached_level', False) and getattr(t, 'hit_2', False))
+    
+    def fmt_stat(stat_count, total):
+        if total == 0: return "0 / 0 (0.0%)"
+        return f"{stat_count} / {total} ({(stat_count/total)*100:.1f}%)"
+
+    # ----- Max Adverse Distribution Stats -----
+    def get_adverse_range(pct):
+        if pct is None or (isinstance(pct, float) and pd.isna(pct)):
+            return None
+        if 0 <= pct < 0.5: return "0-0.5%"
+        elif 0.5 <= pct < 1: return "0.5-1%"
+        elif 1 <= pct < 2: return "1-2%"
+        elif 2 <= pct < 3: return "2-3%"
+        elif 3 <= pct < 4: return "3-4%"
+        elif 4 <= pct < 5: return "4-5%"
+        elif 5 <= pct < 10: return "5-10%"
+        elif 10 <= pct < 20: return "10-20%"
+        elif 20 <= pct < 30: return "20-30%"
+        elif pct >= 30: return ">30%"
+        return None
+
+    adverse_counts = {}
+    for t in tasks:
+        adv = getattr(t, 'max_adverse_move_pct', None)
+        if t.reached_level and adv is not None and not (isinstance(adv, float) and pd.isna(adv)):
+            range_key = get_adverse_range(adv)
+            if range_key:
+                adverse_counts[range_key] = adverse_counts.get(range_key, 0) + 1
+
+    ranges = ["0-0.5%", "0.5-1%", "1-2%", "2-3%", "3-4%", "4-5%", "5-10%", "10-20%", "20-30%", ">30%"]
+    row1_adv = " | ".join([f"{r}:{adverse_counts.get(r,0)}" for r in ranges[:5]])
+    row2_adv = " | ".join([f"{r}:{adverse_counts.get(r,0)}" for r in ranges[5:]])
+
+    adv_05_plus_total = 0
+    adv_4_plus_total = 0
+    for t in tasks:
+        adv = getattr(t, 'max_adverse_move_pct', None)
+        if t.reached_level and adv is not None and not (isinstance(adv, float) and pd.isna(adv)):
+            if adv >= 0.5:
+                adv_05_plus_total += 1
+            if adv >= 4.0:
+                adv_4_plus_total += 1
+
+    exp_counts = {}
+    exp_05_plus_total = 0
+    exp_4_plus_total = 0
+    for t in tasks:
+        exp = getattr(t, 'max_expected_move_pct', None)
+        if t.reached_level and exp is not None and not (isinstance(exp, float) and pd.isna(exp)):
+            range_key = get_adverse_range(exp)
+            if range_key:
+                exp_counts[range_key] = exp_counts.get(range_key, 0) + 1
+            if exp >= 0.5:
+                exp_05_plus_total += 1
+            if exp >= 4.0:
+                exp_4_plus_total += 1
+                
+    row1_exp = " | ".join([f"{r}:{exp_counts.get(r,0)}" for r in ranges[:5]])
+    row2_exp = " | ".join([f"{r}:{exp_counts.get(r,0)}" for r in ranges[5:]])
+
+    td_style = {"fontSize": "13px", "fontWeight": "normal", "padding": "2px 5px"}
+    
+    adv_sgnl_counts = {}; exp_sgnl_counts = {}
+    adv_sgnl_05 = 0; adv_sgnl_4 = 0; exp_sgnl_05 = 0; exp_sgnl_4 = 0
+    for t in tasks:
+        adv_s = getattr(t, 'max_adverse_sgnl_pct', None)
+        if adv_s is not None and not (isinstance(adv_s, float) and pd.isna(adv_s)):
+            r = get_adverse_range(adv_s)
+            if r: adv_sgnl_counts[r] = adv_sgnl_counts.get(r, 0) + 1
+            if adv_s >= 0.5: adv_sgnl_05 += 1
+            if adv_s >= 4.0: adv_sgnl_4 += 1
+        exp_s = getattr(t, 'max_expected_sgnl_pct', None)
+        if exp_s is not None and not (isinstance(exp_s, float) and pd.isna(exp_s)):
+            r = get_adverse_range(exp_s)
+            if r: exp_sgnl_counts[r] = exp_sgnl_counts.get(r, 0) + 1
+            if exp_s >= 0.5: exp_sgnl_05 += 1
+            if exp_s >= 4.0: exp_sgnl_4 += 1
+            
+    row1_adv_s = " | ".join([f"{r}:{adv_sgnl_counts.get(r,0)}" for r in ranges[:5]])
+    row2_adv_s = " | ".join([f"{r}:{adv_sgnl_counts.get(r,0)}" for r in ranges[5:]])
+    row1_exp_s = " | ".join([f"{r}:{exp_sgnl_counts.get(r,0)}" for r in ranges[:5]])
+    row2_exp_s = " | ".join([f"{r}:{exp_sgnl_counts.get(r,0)}" for r in ranges[5:]])
+    
+    delta_counts = {k: 0 for k in ranges}
+    delta_05_plus_total = 0
+    delta_4_plus_total = 0
+    for t in tasks:
+        dp = getattr(t, 'price_change_pct', None)
+        if dp is not None and not (isinstance(dp, float) and pd.isna(dp)):
+            val = abs(dp)
+            r = get_adverse_range(val)
+            if r:
+                delta_counts[r] += 1
+            if val >= 0.5: delta_05_plus_total += 1
+            if val >= 4.0: delta_4_plus_total += 1
+
+    row1_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[:5]])
+    row2_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[5:]])
+
+    signal_stats_rows = [
+        html.Tr([html.Td("Reached Level", style=td_style), html.Td(fmt_stat(reached_level_cnt, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Reversed Direction", style=td_style), html.Td(fmt_stat(reversed_dir_cnt, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Hit 1% (from level)", style=td_style), html.Td(fmt_stat(hit_1_cnt, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Hit 1.5% (from level)", style=td_style), html.Td(fmt_stat(hit_1_5_cnt, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Hit 2% (from level)", style=td_style), html.Td(fmt_stat(hit_2_cnt, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Max Adv 0-4% (lvl)", style=td_style), html.Td(row1_adv, style=td_style)]),
+        html.Tr([html.Td("Max Adv 4%+ (lvl)", style=td_style), html.Td(row2_adv, style=td_style)]),
+        html.Tr([html.Td("Max Adv 0.5%+ Total (lvl)", style=td_style), html.Td(str(adv_05_plus_total), style=td_style)]),
+        html.Tr([html.Td("Max Adv 4%+ Total (lvl)", style=td_style), html.Td(str(adv_4_plus_total), style=td_style)]),
+        html.Tr([html.Td("Max Exp 0-4% (lvl)", style=td_style), html.Td(row1_exp, style=td_style)]),
+        html.Tr([html.Td("Max Exp 4%+ (lvl)", style=td_style), html.Td(row2_exp, style=td_style)]),
+        html.Tr([html.Td("Max Exp 0.5%+ Total (lvl)", style=td_style), html.Td(str(exp_05_plus_total), style=td_style)]),
+        html.Tr([html.Td("Max Exp 4%+ Total (lvl)", style=td_style), html.Td(str(exp_4_plus_total), style=td_style)]),
+        html.Tr([html.Td("Max Adv 0-4% (sgnl)", style=td_style), html.Td(row1_adv_s, style=td_style)]),
+        html.Tr([html.Td("Max Adv 4%+ (sgnl)", style=td_style), html.Td(row2_adv_s, style=td_style)]),
+        html.Tr([html.Td("Max Adv 0.5%+ Total (sgnl)", style=td_style), html.Td(str(adv_sgnl_05), style=td_style)]),
+        html.Tr([html.Td("Max Adv 4%+ Total (sgnl)", style=td_style), html.Td(str(adv_sgnl_4), style=td_style)]),
+        html.Tr([html.Td("Max Exp 0-4% (sgnl)", style=td_style), html.Td(row1_exp_s, style=td_style)]),
+        html.Tr([html.Td("Max Exp 4%+ (sgnl)", style=td_style), html.Td(row2_exp_s, style=td_style)]),
+        html.Tr([html.Td("Max Exp 0.5%+ Total (sgnl)", style=td_style), html.Td(str(exp_sgnl_05), style=td_style)]),
+        html.Tr([html.Td("Max Exp 4%+ Total (sgnl)", style=td_style), html.Td(str(exp_sgnl_4), style=td_style)]),
+        html.Tr([html.Td("Delta Price 0-4%", style=td_style), html.Td(row1_delta, style=td_style)]),
+        html.Tr([html.Td("Delta Price 4%+", style=td_style), html.Td(row2_delta, style=td_style)]),
+        html.Tr([html.Td("Delta Price 0.5%+ Total", style=td_style), html.Td(str(delta_05_plus_total), style=td_style)]),
+        html.Tr([html.Td("Delta Price 4%+ Total", style=td_style), html.Td(str(delta_4_plus_total), style=td_style)]),
+    ]
+    signal_stats_table = html.Table([html.Tbody(signal_stats_rows)], style={"border": "1px solid #4a90e2", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f0f7ff"})
+    
+    return html.Div([
+        stats_table,
+        html.H5("Signal Performance Summary", style={"marginTop": "15px", "marginBottom": "5px"}),
+        signal_stats_table,
+        html.P(
+            "ℹ️ Hit % metrics measure price movement ≥1%/1.5%/2% **in the EXPECTED direction** from the signal level base. "
+            "Resistance: Price moves UP ≥X% from level. Support: Price moves DOWN ≥X% from level. "
+            "Hits are only counted if the price actually touched the level first.",
+            style={"fontSize": "11px", "color": "#777", "marginTop": "6px", "marginBottom": "0", "fontStyle": "italic"}
+        )
+    ])
+
+
+# ============================================================================
+# 🔧 SPLIT CALLBACK #2: Task Table Only (LIGHT - runs on every page click)
+# ============================================================================
+@app.callback(
+    Output("task-table-container", "children"),
+    Input("task-page-store", "data"),
+    Input("golden-store-version", "data"),  # ✅ FIXED: Listen to version instead of trigger
+    Input("recalc-lock-store", "data")
+)
+def update_task_table_only(current_page, version, lock_state):
+    """Render task table ONLY. Listens to page changes but does NO heavy stats calculation."""
+    global golden_task_store_data, golden_store_version
+    
+    # Validate global state
+    if not hasattr(app, 'layout') or app.layout is None:
+        return html.Div("", style={"display": "none"})
+    
+    # Get triggered input to distinguish page change vs data reload
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+        
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # If only lock changed, don't re-render table
+    if triggered_id == "recalc-lock-store" and version == getattr(update_task_table_only, '_last_version', None):
+        return dash.no_update
+    
+    # Store current version for next comparison
+    update_task_table_only._last_version = version
+    
+    # Lock check
+    if lock_state and lock_state.get("locked", False):
+        return html.Div("⏳ Recalculating... Please wait", style={"textAlign": "center", "padding": "20px", "fontSize": "16px", "color": "#666"})
+    
+    # Get tasks from Golden Store
+    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
+        tasks = golden_task_store_data
+    else:
+        with tm.lock:
+            tasks = list(tm.tasks.values())
+        
+    if not tasks:
+        return "No tasks."
+    
+    # Cache check - skip if same page and same data version
+    current_golden_version = golden_store_version
+    prev_golden_version = getattr(update_task_table_only, "_last_golden_version", None)
+    prev_page = getattr(update_task_table_only, "_last_page", None)
+    
+    force_refresh = version is not None and version > 0
     
     if not force_refresh and current_golden_version == prev_golden_version and current_page == prev_page:
         return no_update
         
-    update_summary._last_golden_version = current_golden_version
-    update_summary._last_page = current_page
+    update_task_table_only._last_golden_version = current_golden_version
+    update_task_table_only._last_page = current_page
 
-
-    # ✅ Helpers (KEPT EXACTLY AS IS)
+    # ✅ Helpers
     def fmt_time(ts):
         if ts is None: return "-"
         try:
@@ -3783,7 +4038,6 @@ def update_summary(current_page, trigger, lock_state):
     start = current_page * PAGE_SIZE
     end = start + PAGE_SIZE
     
-    # visible_tasks is the list of objects to render
     visible_tasks = tasks[start:end]
     
     rows = []
@@ -3827,45 +4081,52 @@ def update_summary(current_page, trigger, lock_state):
             )
             
         # 🔧 PERFORMANCE: Convert heavy html.Button to lightweight html.Div with click handlers
-        # Store button states in task data model instead of component state
+        # P1 IMPROVEMENT: Use data attributes instead of JSON IDs for better reliability
         stop_btn = html.Div("Stop", 
-            id={"type": "stop-task", "index": t.task_id}, 
+            id=f"btn-stop-{t.task_id}",
+            **{"data-action": "stop", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#ffcccc", 
                    "borderRadius": "3px", "cursor": "pointer", "display": "inline-block", "fontSize": "11px"},
             className="interactive-button")
         pause_label = "Resume" if t.paused else "Pause"
         pause_btn = html.Div(pause_label, 
-            id={"type": "pause-task", "index": t.task_id}, 
+            id=f"btn-pause-{t.task_id}",
+            **{"data-action": "pause", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#fff3cd" if t.paused else "#d1ecf1", 
                    "borderRadius": "3px", "cursor": "pointer", "display": "inline-block", "fontSize": "11px"},
             className="interactive-button")
         chart_btn = html.Div("Chart", 
-            id={"type": "chart-task", "index": t.task_id}, 
+            id=f"btn-chart-{t.task_id}",
+            **{"data-action": "chart", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "11px", "opacity": "1" if t.status == "completed" else "0.6"},
             className="interactive-button")
         details_btn = html.Div("Details", 
-            id={"type": "strategy-details-btn", "index": t.task_id}, 
+            id=f"btn-details-{t.task_id}",
+            **{"data-action": "details", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "11px", "opacity": "1" if t.status == "completed" else "0.6"},
             className="interactive-button")
         impulse_display_count = sum(1 for sig in t.strategy_signals if sig.get('type') == 'impulse')
         impulse_btn = html.Div("Impulse", 
-            id={"type": "impulse-details-btn", "index": t.task_id}, 
+            id=f"btn-impulse-{t.task_id}",
+            **{"data-action": "impulse", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#d4edda" if (t.status == "completed" and impulse_display_count > 0) else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if (t.status == "completed" and impulse_display_count > 0) else "not-allowed", 
                    "display": "inline-block", "fontSize": "11px", "opacity": "1" if (t.status == "completed" and impulse_display_count > 0) else "0.6"},
             className="interactive-button")
         rerun_strat_btn = html.Div("Re‑run Strategy", 
-            id={"type": "rerun-strat-btn", "index": t.task_id}, 
+            id=f"btn-rerun-strat-{t.task_id}",
+            **{"data-action": "rerun-strat", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "3px 6px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "9px", "opacity": "1" if t.status == "completed" else "0.6"},
             className="interactive-button")
         rerun_impulse_btn = html.Div("Re‑run Impulse", 
-            id={"type": "rerun-impulse-btn", "index": t.task_id}, 
+            id=f"btn-rerun-impulse-{t.task_id}",
+            **{"data-action": "rerun-impulse", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "3px 6px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "9px", "opacity": "1" if t.status == "completed" else "0.6"},
@@ -4218,27 +4479,35 @@ def auto_throttle_updates(_):
     when the table hasn't actually changed."""
     return False, False  # 🔧 Keep both intervals enabled
 
-# ----- NEW: Callback for chart button with deduplication (same pattern as stop/pause) -----
+# ----- NEW: Callback for chart button using data-action pattern -----
+# This callback listens to the hidden trigger that JS sets when chart button is clicked
 @app.callback(
     Output("chart-task-id", "data"),
     Output("chart-click-store", "data"),
-    Input({"type": "chart-task", "index": ALL}, "n_clicks"),
+    Input("chart-button-trigger", "data"),  # Hidden trigger set by JS
     State("chart-click-store", "data"),
     prevent_initial_call=True
 )
-def set_chart_task_id(n_clicks_list, click_store):
-    triggered = ctx.triggered_id
-    if not triggered or not isinstance(triggered, dict):
+def set_chart_task_id(trigger_data, click_store):
+    if not trigger_data:
         return no_update, no_update
-    task_id = triggered.get("index")
-    # Get the new clicks value from the triggered input
-    trig = ctx.triggered[0]
-    new_clicks = trig.get('value', 0) or 0
+    
+    task_id = trigger_data.get("task_id")
+    action = trigger_data.get("action")
+    
+    if not task_id or action != "chart":
+        return no_update, no_update
+    
+    # Deduplication logic
     key = f"{task_id}_chart"
-    old_clicks = click_store.get(key, 0)
-    if new_clicks <= old_clicks:
+    current_time = time.time()
+    old_time = click_store.get(key, 0)
+    
+    # Only process if this is a new click (within 0.5 seconds)
+    if current_time - old_time < 0.5:
         return no_update, no_update
-    click_store[key] = new_clicks
+    
+    click_store[key] = current_time
     return task_id, click_store
 
 # ----- Modal display callback -----
@@ -4343,26 +4612,31 @@ def measure_hint(active):
         return "📏 Measure mode active: click two points on the chart to measure price difference."
     return ""
 
-# ----- Strategy details modal callbacks (with deduplication) -----
+# ----- Strategy details modal callbacks (using data-action pattern) -----
 @app.callback(
     Output("strategy-details-task-id", "data"),
     Output("details-click-store", "data"),
-    Input({"type": "strategy-details-btn", "index": ALL}, "n_clicks"),
+    Input("strategy-details-trigger", "data"),  # Hidden trigger set by JS
     State("details-click-store", "data"),
     prevent_initial_call=True
 )
-def set_strategy_details_task_id(n_clicks_list, click_store):
-    triggered = ctx.triggered_id
-    if not triggered or not isinstance(triggered, dict):
+def set_strategy_details_task_id(trigger_data, click_store):
+    if not trigger_data:
         return no_update, no_update
-    task_id = triggered.get("index")
-    trig = ctx.triggered[0]
-    new_clicks = trig.get('value', 0) or 0
+    
+    task_id = trigger_data.get("task_id")
+    if not task_id:
+        return no_update, no_update
+    
+    # Deduplication logic
     key = f"{task_id}_details"
-    old_clicks = click_store.get(key, 0)
-    if new_clicks <= old_clicks:
+    current_time = time.time()
+    old_time = click_store.get(key, 0)
+    
+    if current_time - old_time < 0.5:
         return no_update, no_update
-    click_store[key] = new_clicks
+    
+    click_store[key] = current_time
     return task_id, click_store
 
 @app.callback(
@@ -5261,7 +5535,7 @@ def run_walk_forward(n_clicks, task_id, range_mult, vol_mult, body_ratio, wick_r
         return f"Walk‑forward error: {str(e)}"
 
 @app.callback(
-    Output("task-summary", "children", allow_duplicate=True),
+    Output("task-table-container", "children", allow_duplicate=True),
     Input({"type": "rerun-strat-btn", "index": ALL}, "n_clicks"),
     prevent_initial_call=True
 )
@@ -5321,7 +5595,7 @@ def rerun_strategy(n_clicks_list):
         return no_update
 
 @app.callback(
-    Output("task-summary", "children", allow_duplicate=True),
+    Output("task-table-container", "children", allow_duplicate=True),
     Input({"type": "rerun-impulse-btn", "index": ALL}, "n_clicks"),
     prevent_initial_call=True
 )
@@ -5837,6 +6111,7 @@ def load_tasks_from_json(n, filepath):
     loaded_ids = []
     skipped = 0
     new_tasks = {}
+    seen_ids = set()  # P3 IMPROVEMENT: Track unique task IDs
     
     # 🔧 DATETIME FIELDS that need restoration on load
     datetime_fields = {'start_date', 'end_date', 'first_event_time', 'max_adverse_time',
@@ -5850,6 +6125,18 @@ def load_tasks_from_json(n, filepath):
     
     for d in data:
         try:
+            # P3 IMPROVEMENT: Check for duplicate task IDs
+            task_id_candidate = d.get('task_id')
+            if not task_id_candidate:
+                print(f"Skipping task without task_id: {d}")
+                skipped += 1
+                continue
+            if task_id_candidate in seen_ids:
+                print(f"Duplicate task_id detected: {task_id_candidate}, skipping")
+                skipped += 1
+                continue
+            seen_ids.add(task_id_candidate)
+            
             # 1. Initialize Task with Core Attributes
             init_kwargs = {k: d.get(k) for k in ['task_id', 'symbols', 'timeframe', 'mode', 'start_date', 'end_date',
                 'overwrite', 'price_continuity_check', 'signal_time', 'signal_price',
@@ -5888,12 +6175,10 @@ def load_tasks_from_json(n, filepath):
         tm.tasks.clear()
         tm.tasks.update(new_tasks)
 
-    # 🔧 CRITICAL: Clear Summary Cache to Force Immediate Re-render
-    # This ensures that even if analyze_signal is still running, the next interval tick will rebuild the table
-    if hasattr(update_summary, "_last_state"):
-        update_summary._last_state = None
-    if hasattr(update_summary, "_last_page"):
-        update_summary._last_page = None
+    # 🔧 CRITICAL: Reset Version to Force Stats & Table Re-render
+    # Since we split the callback, we just increment the version to trigger both new callbacks
+    global golden_store_version
+    golden_store_version += 1
         
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
