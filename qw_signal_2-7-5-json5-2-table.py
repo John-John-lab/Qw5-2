@@ -2580,23 +2580,41 @@ document.addEventListener('click', function(e) {
     // Support both BUTTON and DIV elements with interactive-button class
     if ((target.tagName === 'BUTTON' || (target.tagName === 'DIV' && target.classList.contains('interactive-button'))) && target.id) {
         try {
-            let idObj = JSON.parse(target.id);
-            if (idObj.type === 'pause-task' || idObj.type === 'stop-task' || idObj.type === 'save-log') {
-                let taskId = idObj.index;
-                let action = idObj.type === 'save-log' ? 'save' : (idObj.type === 'stop-task' ? 'stop' : 'pause');
+            // P1 IMPROVEMENT: Use data attributes instead of JSON parsing for better reliability
+            let actionType = target.getAttribute('data-action');
+            let taskId = target.getAttribute('data-task-id');
+            
+            // Fallback to old JSON parsing method for backward compatibility during transition
+            if (!actionType || !taskId) {
+                console.warn('Using legacy JSON ID parsing. Please update button generation.');
+                let idObj = JSON.parse(target.id);
+                if (idObj.type === 'pause-task' || idObj.type === 'stop-task' || idObj.type === 'save-log') {
+                    taskId = idObj.index;
+                    actionType = idObj.type === 'save-log' ? 'save' : (idObj.type === 'stop-task' ? 'stop' : 'pause');
+                }
+            }
+            
+            // Process action if we have valid data
+            if (actionType && taskId) {
                 fetch('/task-action', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({task_id: taskId, action: action})
+                    body: JSON.stringify({task_id: taskId, action: actionType})
                 })
                 .then(response => response.json())
                 .then(data => {
-                    if (data.success && action === 'pause') {
+                    if (data.success && actionType === 'pause') {
                         target.innerText = data.new_label;
                     }
+                })
+                .catch(err => {
+                    console.error('Task action fetch failed:', err, 'Task ID:', taskId, 'Action:', actionType);
                 });
             }
-        } catch (e) {}
+        } catch (e) {
+            // P1 CRITICAL: Log errors instead of silently swallowing them
+            console.error('Button click handler error:', e, 'Target ID:', target.id, 'Target:', target);
+        }
     }
 });
 // Toggle column highlight on header click
@@ -3713,6 +3731,10 @@ def update_progress(_, stores):
 def update_summary(current_page, trigger, lock_state):
     global golden_task_store_data, golden_store_version, recalculation_complete_timestamp
     
+    # P2 IMPROVEMENT: Validate global state before proceeding
+    if golden_task_store_data is None and not hasattr(tm, 'tasks'):
+        return html.Div("⏳ Initializing...", style={"textAlign": "center", "padding": "20px", "color": "#666"})
+    
     # 🔧 RECALCULATION LOCK CHECK: Prevent rendering during heavy processing
     if lock_state and lock_state.get("locked", False):
         return html.Div([
@@ -3827,45 +3849,52 @@ def update_summary(current_page, trigger, lock_state):
             )
             
         # 🔧 PERFORMANCE: Convert heavy html.Button to lightweight html.Div with click handlers
-        # Store button states in task data model instead of component state
+        # P1 IMPROVEMENT: Use data attributes instead of JSON IDs for better reliability
         stop_btn = html.Div("Stop", 
-            id={"type": "stop-task", "index": t.task_id}, 
+            id=f"btn-stop-{t.task_id}",
+            **{"data-action": "stop", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#ffcccc", 
                    "borderRadius": "3px", "cursor": "pointer", "display": "inline-block", "fontSize": "11px"},
             className="interactive-button")
         pause_label = "Resume" if t.paused else "Pause"
         pause_btn = html.Div(pause_label, 
-            id={"type": "pause-task", "index": t.task_id}, 
+            id=f"btn-pause-{t.task_id}",
+            **{"data-action": "pause", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#fff3cd" if t.paused else "#d1ecf1", 
                    "borderRadius": "3px", "cursor": "pointer", "display": "inline-block", "fontSize": "11px"},
             className="interactive-button")
         chart_btn = html.Div("Chart", 
-            id={"type": "chart-task", "index": t.task_id}, 
+            id=f"btn-chart-{t.task_id}",
+            **{"data-action": "chart", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "11px", "opacity": "1" if t.status == "completed" else "0.6"},
             className="interactive-button")
         details_btn = html.Div("Details", 
-            id={"type": "strategy-details-btn", "index": t.task_id}, 
+            id=f"btn-details-{t.task_id}",
+            **{"data-action": "details", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "11px", "opacity": "1" if t.status == "completed" else "0.6"},
             className="interactive-button")
         impulse_display_count = sum(1 for sig in t.strategy_signals if sig.get('type') == 'impulse')
         impulse_btn = html.Div("Impulse", 
-            id={"type": "impulse-details-btn", "index": t.task_id}, 
+            id=f"btn-impulse-{t.task_id}",
+            **{"data-action": "impulse", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#d4edda" if (t.status == "completed" and impulse_display_count > 0) else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if (t.status == "completed" and impulse_display_count > 0) else "not-allowed", 
                    "display": "inline-block", "fontSize": "11px", "opacity": "1" if (t.status == "completed" and impulse_display_count > 0) else "0.6"},
             className="interactive-button")
         rerun_strat_btn = html.Div("Re‑run Strategy", 
-            id={"type": "rerun-strat-btn", "index": t.task_id}, 
+            id=f"btn-rerun-strat-{t.task_id}",
+            **{"data-action": "rerun-strat", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "3px 6px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "9px", "opacity": "1" if t.status == "completed" else "0.6"},
             className="interactive-button")
         rerun_impulse_btn = html.Div("Re‑run Impulse", 
-            id={"type": "rerun-impulse-btn", "index": t.task_id}, 
+            id=f"btn-rerun-impulse-{t.task_id}",
+            **{"data-action": "rerun-impulse", "data-task-id": str(t.task_id)},
             style={"margin": "2px", "padding": "3px 6px", "backgroundColor": "#d4edda" if t.status == "completed" else "#e9ecef", 
                    "borderRadius": "3px", "cursor": "pointer" if t.status == "completed" else "not-allowed", 
                    "display": "inline-block", "fontSize": "9px", "opacity": "1" if t.status == "completed" else "0.6"},
@@ -5837,6 +5866,7 @@ def load_tasks_from_json(n, filepath):
     loaded_ids = []
     skipped = 0
     new_tasks = {}
+    seen_ids = set()  # P3 IMPROVEMENT: Track unique task IDs
     
     # 🔧 DATETIME FIELDS that need restoration on load
     datetime_fields = {'start_date', 'end_date', 'first_event_time', 'max_adverse_time',
@@ -5850,6 +5880,18 @@ def load_tasks_from_json(n, filepath):
     
     for d in data:
         try:
+            # P3 IMPROVEMENT: Check for duplicate task IDs
+            task_id_candidate = d.get('task_id')
+            if not task_id_candidate:
+                print(f"Skipping task without task_id: {d}")
+                skipped += 1
+                continue
+            if task_id_candidate in seen_ids:
+                print(f"Duplicate task_id detected: {task_id_candidate}, skipping")
+                skipped += 1
+                continue
+            seen_ids.add(task_id_candidate)
+            
             # 1. Initialize Task with Core Attributes
             init_kwargs = {k: d.get(k) for k in ['task_id', 'symbols', 'timeframe', 'mode', 'start_date', 'end_date',
                 'overwrite', 'price_continuity_check', 'signal_time', 'signal_price',
