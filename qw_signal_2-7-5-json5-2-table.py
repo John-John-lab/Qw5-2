@@ -3200,10 +3200,9 @@ def render_tab(tab):
                 ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px", "marginTop": "10px", "maxHeight": "400px", "overflowY": "auto"})
             ], style={"marginBottom": "20px"}),
             html.Hr(),
-            html.Div(id="tasks-container"),
+            html.Div(id="task-table-container", style={"width": "100%"}),
             html.Hr(),
             html.Div(id="summary-stats-container", style={"max-height": "400px", "overflow-y": "auto", "border": "1px solid #aaa", "padding": "10px"}),
-            html.Div(id="task-table-container", style={"width": "100%"}),
         ])
     else:
         # Data Analysis tab (unchanged)
