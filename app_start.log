@@ -1,0 +1,7 @@
+OpenBLAS WARNING - could not determine the L2 cache size on this system, assuming 256k
+DuckDB not installed. The DuckDB query button will not work. Install with: pip install duckdb
+Dash is running on http://127.0.0.1:8050/
+
+ * Serving Flask app 'qw_signal_2-7-5-json5-2-table'
+ * Debug mode: on
+OpenBLAS WARNING - could not determine the L2 cache size on this system, assuming 256k

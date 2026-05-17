@@ -2089,15 +2089,10 @@ class DownloadTask:
         # 🔧 CRITICAL: Invalidate Summary Cache so UI updates immediately after analysis
         try:
             from dash import no_update
-            # Access the global update_summary function to clear its cache
-            if 'app' in sys.modules:
-                app_module = sys.modules['app']
-                if hasattr(app_module, 'update_summary'):
-                    update_func = app_module.update_summary
-                    if hasattr(update_func, '_last_state'):
-                        update_func._last_state = None
-                    if hasattr(update_func, '_last_page'):
-                        update_func._last_page = None
+            # Since we split update_summary into two callbacks, we just increment the version
+            # to trigger both update_summary_stats_only and update_task_table_only
+            global golden_store_version
+            golden_store_version += 1
         except Exception:
             pass
 
@@ -6152,12 +6147,10 @@ def load_tasks_from_json(n, filepath):
         tm.tasks.clear()
         tm.tasks.update(new_tasks)
 
-    # 🔧 CRITICAL: Clear Summary Cache to Force Immediate Re-render
-    # This ensures that even if analyze_signal is still running, the next interval tick will rebuild the table
-    if hasattr(update_summary, "_last_state"):
-        update_summary._last_state = None
-    if hasattr(update_summary, "_last_page"):
-        update_summary._last_page = None
+    # 🔧 CRITICAL: Reset Version to Force Stats & Table Re-render
+    # Since we split the callback, we just increment the version to trigger both new callbacks
+    global golden_store_version
+    golden_store_version += 1
         
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
