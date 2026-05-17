@@ -3739,11 +3739,10 @@ def update_progress(_, stores):
 # ============================================================================
 @app.callback(
     Output("summary-stats-container", "children"),
-    Input("analysis-complete-trigger", "data"),  # Only trigger when data loads/recalcs
-    Input("recalc-lock-store", "data"),
-    State("task-page-store", "data")  # Read page but don't trigger on it
+    Input("golden-store-version", "data"),  # ✅ FIXED: Only trigger when data version changes (not on page clicks)
+    Input("recalc-lock-store", "data")
 )
-def update_summary_stats_only(trigger, lock_state, current_page):
+def update_summary_stats_only(version, lock_state):
     """Calculate summary statistics ONLY when golden_store_version changes.
     Does NOT run on page navigation - this is the key fix for 10-minute freeze."""
     global golden_task_store_data, golden_store_version, recalculation_complete_timestamp
@@ -3773,22 +3772,16 @@ def update_summary_stats_only(trigger, lock_state, current_page):
     total_tasks = len(tasks)
     completed_count = sum(1 for t in tasks if t.status == "completed")
     
-    # Page-specific averages (need current page, but calculation is light)
-    PAGE_SIZE = 300
-    total_pages = max(1, (len(tasks) + PAGE_SIZE - 1) // PAGE_SIZE)
-    current_page = max(0, min(current_page or 0, total_pages - 1))
-    start = current_page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    visible_tasks = tasks[start:end]
-    
-    avg_adv = np.mean([t.max_adverse_move_pct for t in visible_tasks if t.max_adverse_move_pct is not None and not pd.isna(t.max_adverse_move_pct)] or [0])
-    avg_dd = np.mean([t.drawdown_before_level for t in visible_tasks if t.drawdown_before_level is not None and not pd.isna(t.drawdown_before_level)] or [0])
+    # ✅ FIXED: Removed page-specific averages from stats (they were causing confusion)
+    # Stats now show GLOBAL averages across ALL tasks, not just visible page
+    avg_adv = np.mean([t.max_adverse_move_pct for t in tasks if t.max_adverse_move_pct is not None and not pd.isna(t.max_adverse_move_pct)] or [0])
+    avg_dd = np.mean([t.drawdown_before_level for t in tasks if t.drawdown_before_level is not None and not pd.isna(t.drawdown_before_level)] or [0])
     
     stats_rows = [
         html.Tr([html.Td("✅ Task Completed 100%"), html.Td(str(completed_count))]),
         html.Tr([html.Td("📦 Total Task"), html.Td(str(total_tasks))]),
-        html.Tr([html.Td("📉 Avg Max Adverse (Page)"), html.Td(f"{avg_adv:.2f}%")]),
-        html.Tr([html.Td("📉 Avg Drawdown Lvl (Page)"), html.Td(f"{avg_dd:.2f}%")])
+        html.Tr([html.Td("📉 Avg Max Adverse (Global)"), html.Td(f"{avg_adv:.2f}%")]),
+        html.Tr([html.Td("📉 Avg Drawdown Lvl (Global)"), html.Td(f"{avg_dd:.2f}%")])
     ]
     stats_table = html.Table([html.Tbody(stats_rows)], style={"border": "1px solid #ccc", "padding": "5px", "fontSize": "13px", "backgroundColor": "#f9f9f9"})
     
@@ -3945,10 +3938,10 @@ def update_summary_stats_only(trigger, lock_state, current_page):
 @app.callback(
     Output("task-table-container", "children"),
     Input("task-page-store", "data"),
-    Input("analysis-complete-trigger", "data"),
+    Input("golden-store-version", "data"),  # ✅ FIXED: Listen to version instead of trigger
     Input("recalc-lock-store", "data")
 )
-def update_task_table_only(current_page, trigger, lock_state):
+def update_task_table_only(current_page, version, lock_state):
     """Render task table ONLY. Listens to page changes but does NO heavy stats calculation."""
     global golden_task_store_data, golden_store_version
     
@@ -3975,7 +3968,7 @@ def update_task_table_only(current_page, trigger, lock_state):
     prev_golden_version = getattr(update_task_table_only, "_last_golden_version", None)
     prev_page = getattr(update_task_table_only, "_last_page", None)
     
-    force_refresh = trigger is not None and trigger > 0
+    force_refresh = version is not None and version > 0
     
     if not force_refresh and current_golden_version == prev_golden_version and current_page == prev_page:
         return no_update
